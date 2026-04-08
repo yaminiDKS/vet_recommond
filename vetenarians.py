@@ -4,36 +4,13 @@ import pandas as pd
 import streamlit as st
 
 from groq import Groq
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ==========================
 # Groq client
 # ==========================
-# Put your real Groq API key here
 client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-
-
-# ==========================
-# Embedding model (local)
-# ==========================
-@st.cache_resource
-def load_embedding_model():
-    # Small, fast, good quality sentence embedding model
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-
-def embed_texts(texts):
-    """
-    Batch-embed a list of texts and return a normalized numpy array.
-    """
-    model = load_embedding_model()
-    # encode returns a numpy array directly when convert_to_numpy=True
-    embeddings = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,  # already L2 normalized
-    )
-    return embeddings.astype("float32")
 
 
 # ==========================
@@ -46,7 +23,7 @@ def row_to_text(row, city: str) -> str:
         f"Address: {row.get('Address', '')}, "
         f"Phone: {row.get('Justdial Phone', '')}, "
         f"Business Phone: {row.get('Business Phone', '')}, "
-        f"Hours of operations: {row.get('Hours of operations', '')}, "
+        f"Hours: {row.get('Hours of operations', '')}, "
         f"Rating: {row.get('Rating', '')}, "
         f"Reviews: {row.get('Reviews', '')}"
     )
@@ -68,23 +45,22 @@ def load_data_and_embeddings():
         texts = df.apply(lambda r: row_to_text(r, city_name), axis=1).tolist()
         all_texts.extend(texts)
 
-    # Local embeddings instead of Groq embeddings
-    normalized_embeddings = embed_texts(all_texts)
+    # TF-IDF embeddings
+    vectorizer = TfidfVectorizer()
+    embeddings = vectorizer.fit_transform(all_texts)
 
-    return all_texts, normalized_embeddings
+    return all_texts, embeddings, vectorizer
 
 
 # ==========================
-# Semantic search + Groq streaming
+# Semantic search + Groq
 # ==========================
-def query_vets_streaming(normalized_embeddings, all_texts, user_query: str, top_k: int):
-    # Embed query locally
-    query_embedding = embed_texts([user_query])[0]  # shape (d,)
+def query_vets_streaming(embeddings, all_texts, vectorizer, user_query, top_k):
 
-    # Cosine similarity since both sides are normalized
-    similarity_scores = np.dot(normalized_embeddings, query_embedding)
+    query_vec = vectorizer.transform([user_query])
 
-    # Top K indices
+    similarity_scores = cosine_similarity(query_vec, embeddings)[0]
+
     top_indices = np.argsort(similarity_scores)[-top_k:][::-1]
     top_records = [all_texts[i] for i in top_indices]
 
@@ -99,13 +75,13 @@ Relevant veterinarian records:
 User query:
 {user_query}
 
-Provide a concise, high-quality answer:
-- Use bullet points.
-- Highlight city, rating, and contact details.
-- Mention why each vet is a good choice relative to the query.
+Provide:
+- bullet points
+- show rating
+- show phone
+- explain why best
 """
 
-    # === Groq chat in the format you gave ===
     completion = client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=[
@@ -116,55 +92,62 @@ Provide a concise, high-quality answer:
         ],
         temperature=1,
         max_completion_tokens=2048,
-        top_p=1,
-        reasoning_effort="medium",
         stream=True,
-        stop=None,
     )
 
     return completion, top_records
 
 
 # ==========================
-# Streamlit App
+# Streamlit UI
 # ==========================
-st.title("Vet Finder – Groq OSS GPT + Local Embeddings")
-st.write(
-    "Search veterinarians using local sentence embeddings for retrieval "
-    "and Groq `openai/gpt-oss-120b` for summarization."
+st.title("Vet Finder – Groq + TFIDF Search")
+
+st.info("Loading veterinarian data...")
+
+all_texts, embeddings, vectorizer = load_data_and_embeddings()
+
+st.success("Data loaded successfully")
+
+query = st.text_input(
+    "Enter query",
+    placeholder="Top vets in Chennai"
 )
 
-st.info("Loading veterinarian data and generating embeddings...")
-all_texts, normalized_embeddings = load_data_and_embeddings()
-st.success("Data loaded successfully.")
-
-query = st.text_input("Enter your query (e.g., 'Top vets in Chennai', '24/7 vet in Madurai')")
-top_k = st.slider("Number of vets to retrieve", min_value=1, max_value=10, value=3)
+top_k = st.slider(
+    "Number of vets",
+    1,
+    10,
+    3
+)
 
 if st.button("Search"):
+
     if not query.strip():
-        st.warning("Please enter a query to search for veterinarians.")
+        st.warning("Enter query")
+
     else:
-        with st.spinner("Searching and generating answer..."):
-            completion, raw_results = query_vets_streaming(
-                normalized_embeddings,
-                all_texts,
-                query,
-                top_k,
-            )
 
-        st.subheader("🔍 AI Summary")
+        completion, raw_results = query_vets_streaming(
+            embeddings,
+            all_texts,
+            vectorizer,
+            query,
+            top_k
+        )
 
-        summary_placeholder = st.empty()
-        accumulated = ""
+        st.subheader("AI Summary")
 
-        # Stream output from Groq
+        placeholder = st.empty()
+        text = ""
+
         for chunk in completion:
             delta = chunk.choices[0].delta.content
             if delta:
-                accumulated += delta
-                summary_placeholder.markdown(accumulated)
+                text += delta
+                placeholder.markdown(text)
 
-        st.subheader("📋 Top Matching Veterinarian Entries (Raw)")
-        for i, text in enumerate(raw_results, start=1):
-            st.write(f"**{i}.** {text}")
+        st.subheader("Top Matches")
+
+        for i, r in enumerate(raw_results, 1):
+            st.write(f"**{i}.** {r}")
